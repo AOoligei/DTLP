@@ -1,0 +1,9 @@
+torch>=2.4.0
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+tqdm>=4.66
+pytz>=2023.3
+requests>=2.31
+py-tgb==2.2.0
+tgb==1.2.0

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pkl
+*.npy
+*.ckpt
+*.pt
+*.pth
+logs/
+results/
+datasets/
+saved_models/
+.vscode/
+.idea/
+*.egg-info/
+.DS_Store
