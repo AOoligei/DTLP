@@ -2,6 +2,67 @@
 
 Code for NeurIPS 2026 submission on **pair recurrence rate** (ρ) as a first-class organizing concept for temporal link prediction, and the **Pathway-Aligned Supervision (PAS)** mechanism.
 
+## Repository structure
+
+```
+DTLP/
+├── src/                      # DTLP core scripts (train from scratch)
+│   ├── run_tkg_hybrid.py     # DTLP for TKG/THG/tgbl-* (link prediction)
+│   ├── run_tkg_hybrid_gated.py
+│   ├── run_node_pred_v2.py   # DTLP for tgbn-* (node property prediction)
+│   ├── run_node_pred_tpnet.py  # TPNet-backbone node-pred variant
+│   └── run_tgbseq.py         # DTLP adaptation for TGB-Seq
+├── external/
+│   └── craft_v2/             # backbone models (ALL included)
+│       ├── train_link_prediction.py  # unified launcher for all backbones
+│       ├── models/
+│       │   ├── TPNet.py      # TPNet — used for Yelp/WikiLink/Taobao/ML-20M
+│       │   ├── CRAFT.py      # CRAFT — alt backbone for LP
+│       │   ├── DyGFormer.py, GraphMixer.py, CAWN.py  # baselines
+│       │   └── dual_path_predictor.py  # PAS decoder
+│       └── utils/DataLoader.py  # includes our thgl-* ns fix
+├── scripts/
+│   └── pipeline_sota.sh      # auto DTLP → TPNet+PAS → CRAFT+PAS escalation
+├── COLLABORATORS.md          # per-collaborator dataset assignments
+└── README.md
+```
+
+## For collaborators (TL;DR)
+
+**Which dataset is yours?** See [COLLABORATORS.md](COLLABORATORS.md). Summary:
+
+| You are | Run these | Why you got them | GPU needed |
+|---|---|---|---|
+| **C1** | Yelp, WikiLink | largest gap (-45%, -14%), longest runtime (2-3 days each) | 24GB (4090 / A100) |
+| **C2** | ML-20M, Taobao | medium datasets, need CRAFT vs TPNet comparison | 12-24GB (3090/4090) |
+| **C3** | tgbn-token | 51M edges, warmup heavy but single script | any 8GB+ |
+| **Lead** | coin/comment/flight/GoogleLocal/thgl-software | all close-gap, needs careful HP tuning | 4090 (local) |
+
+**Single command to start (collaborators)**:
+```bash
+# 1. Clone everything (no submodules, no separate repo)
+git clone https://github.com/AOoligei/DTLP /data/DTLP && cd /data/DTLP
+
+# 2. Install deps
+conda create -n dtlp python=3.10 -y && conda activate dtlp
+pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+pip install numpy pandas scikit-learn tqdm pytz requests py-tgb==2.2.0 tgb==1.2.0 tgb-seq
+
+# 3. Launch your dataset (example: Yelp)
+cd external/craft_v2
+CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
+  --dataset_name Yelp --model_name TPNet --seed 42 \
+  --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
+  --training_mode joint_random --test_interval_epochs 1 --load_best_configs \
+  > logs/Yelp_jr_s42.log 2>&1 &
+```
+Data auto-downloads on first run. Answer `y` to prompt or set `builtins.input = lambda *a, **k: 'y'` in a Python wrapper.
+
+**Monitoring**: `tail -f external/craft_v2/logs/Yelp_jr_s42.log | tr '\r' '\n' | grep 'validate mrr'`.
+
+**Report back**: best test MRR + GPU used + hours + log file. Share in group chat.
+
 ## TL;DR
 
 | Concept | What it is |

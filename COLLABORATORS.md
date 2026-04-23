@@ -1,26 +1,26 @@
 # Collaborator Guide — DTLP+PAS Experiments
 
-For NeurIPS 2026 deadline reproduction. Each collaborator gets a subset of datasets to train.
+For NeurIPS 2026 deadline. ALL code in this one repo (DTLP + backbones).
 
-## Assignment (suggested)
+## Assignments
 
-| Collaborator | Dataset | Baseline | Our gap | Expected time |
-|---|---|---|---|---|
-| C1 | Yelp | CRAFT 0.727 | -45% | 3 days |
-| C1 | WikiLink | CRAFT 0.755 | -14% | 2 days |
-| C2 | ML-20M | CRAFT 0.359 | -14% | 1 day |
-| C2 | Taobao | CRAFT 0.707 | -8% | 2 days |
-| C3 | tgbn-token | NAVIS 0.513 | unknown | 1 day |
-| (self) | coin / comment / flight / GoogleLocal / thgl-software | close-gap | small | hours |
+| Collaborator | Datasets | Baseline | Our current gap | GPU needed | Time budget | Backbone needed |
+|---|---|---|---|---|---|---|
+| **C1** | Yelp | CRAFT 0.727 | -45% | 24GB (4090/A100) | 3 days | TPNet+PAS |
+| **C1** | WikiLink | CRAFT 0.755 | -14% | 24GB | 2 days | TPNet+PAS |
+| **C2** | ML-20M | CRAFT 0.359 | -14% | 12-24GB | 1 day | TPNet+PAS + CRAFT+PAS |
+| **C2** | Taobao | CRAFT 0.707 | -8% | 24GB | 2 days | TPNet+PAS |
+| **C3** | tgbn-token | NAVIS 0.513 | unknown | any 8GB+ | 1 day | DTLP only (no backbone needed) |
+| (Lead) | coin/comment/flight/GoogleLocal/thgl-software | close-gap | -0.9% to -25% | 4090 | hours each | various |
 
-## Setup
+## One-time setup
 
 ```bash
-# Clone both repos
+# 1. Clone. ALL code (DTLP + TPNet/CRAFT backbone) included.
 git clone https://github.com/AOoligei/DTLP /data/DTLP
-git clone https://github.com/AOoligei/CRAFT /data/CRAFT_v2
+cd /data/DTLP
 
-# Python env
+# 2. Python env
 conda create -n dtlp python=3.10 -y
 conda activate dtlp
 pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
@@ -28,83 +28,74 @@ pip install numpy pandas scikit-learn tqdm pytz requests
 pip install py-tgb==2.2.0 tgb==1.2.0 tgb-seq
 ```
 
-## Download data
+## Run your dataset
 
-TGB-Seq (Taobao/Yelp/WikiLink/ML-20M/YouTube/Flickr/GoogleLocal/Patent) — auto-downloaded by `tgb-seq` on first use. Cache at `$dataset_path/<dataset>/`.
-
+### C1 — Yelp (TPNet+PAS)
 ```bash
-# Test download (just run once, answer y to prompt)
-cd /data/CRAFT_v2 && python -c "from tgb_seq.LinkPred.dataloader import TGBSeqLoader; TGBSeqLoader('Yelp', '/data/CRAFT_v2/data/')"
+cd /data/DTLP/external/craft_v2
+mkdir -p logs data
+# jr mode (default best)
+CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
+  --dataset_name Yelp --model_name TPNet --seed 42 \
+  --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
+  --training_mode joint_random --test_interval_epochs 1 --load_best_configs \
+  > logs/Yelp_jr_s42.log 2>&1 &
+# sg mode (alternative)
+CUDA_VISIBLE_DEVICES=1 python -u train_link_prediction.py \
+  --dataset_name Yelp --model_name TPNet --seed 42 \
+  --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
+  --training_mode decoupled_stopgrad --test_interval_epochs 1 --load_best_configs \
+  > logs/Yelp_sg_s42.log 2>&1 &
 ```
+**Target**: test MRR > 0.727. Data auto-downloads on first run.
 
-TGB-LP (tgbl-coin/comment/flight/wiki/review) and TGB-NodePred (tgbn-trade/genre/reddit/token) and TGB-THG (thgl-*) auto-download via pip `tgb`.
-
+### C1 — WikiLink (TPNet+PAS)
 ```bash
-# Python one-liner to pre-download thgl-software (adapt for other datasets)
-python -c "
-import sys; sys.path.insert(0, '/data/CRAFT_v2')
-import builtins
-builtins.input = lambda *a, **k: 'y'
-from tgb.linkproppred.dataset import LinkPropPredDataset
-ds = LinkPropPredDataset(name='thgl-software', root='datasets/', preprocess=True)
-"
-```
-
-## Launch commands per dataset (close-gap datasets not listed — self)
-
-### Yelp (TPNet+PAS, large)
-```bash
-cd /data/CRAFT_v2
-for mode in joint_random decoupled_stopgrad; do
-  CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
-    --dataset_name Yelp --model_name TPNet --seed 42 \
-    --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
-    --patience 10 --gpu 0 --dataset_path /data/CRAFT_v2/data/ \
-    --training_mode $mode --test_interval_epochs 1 --load_best_configs \
-    > logs/Yelp_${mode}.log 2>&1 &
-done
-```
-Target: > CRAFT 0.727.
-
-### WikiLink (TPNet+PAS)
-```bash
-cd /data/CRAFT_v2
+cd /data/DTLP/external/craft_v2
 CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
   --dataset_name WikiLink --model_name TPNet --seed 42 \
   --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
-  --patience 10 --gpu 0 --dataset_path /data/CRAFT_v2/data/ \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
   --training_mode joint_random --test_interval_epochs 1 --load_best_configs \
-  > logs/WikiLink_jr.log 2>&1 &
+  > logs/WikiLink_jr_s42.log 2>&1 &
 ```
-Target: > CRAFT 0.755.
+**Target**: test MRR > 0.755.
 
-### ML-20M (CRAFT+PAS, try both modes)
+### C2 — ML-20M (TPNet+PAS AND CRAFT+PAS)
 ```bash
-cd /data/CRAFT_v2
-for mode in joint_random decoupled_stopgrad; do
-  CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
-    --dataset_name ML-20M --model_name CRAFT --seed 42 \
-    --batch_size 200 --learning_rate 1e-4 --num_epochs 100 --num_runs 1 \
-    --patience 10 --gpu 0 --dataset_path /data/CRAFT_v2/data/ \
-    --training_mode $mode --load_best_configs \
-    > logs/ML-20M_CRAFT_${mode}.log 2>&1 &
-done
+cd /data/DTLP/external/craft_v2
+# TPNet+PAS
+CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
+  --dataset_name ML-20M --model_name TPNet --seed 42 \
+  --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
+  --training_mode joint_random --test_interval_epochs 1 --load_best_configs \
+  > logs/ML-20M_TPNet_jr.log 2>&1 &
+# CRAFT+PAS
+CUDA_VISIBLE_DEVICES=1 python -u train_link_prediction.py \
+  --dataset_name ML-20M --model_name CRAFT --seed 42 \
+  --batch_size 200 --learning_rate 1e-4 --num_epochs 100 --num_runs 1 \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
+  --training_mode joint_random --load_best_configs \
+  > logs/ML-20M_CRAFT_jr.log 2>&1 &
 ```
-Target: > CRAFT 0.359.
+**Target**: test MRR > 0.359.
 
-### Taobao (TPNet+PAS)
+### C2 — Taobao (TPNet+PAS)
 ```bash
-cd /data/CRAFT_v2
+cd /data/DTLP/external/craft_v2
 CUDA_VISIBLE_DEVICES=0 python -u train_link_prediction.py \
   --dataset_name Taobao --model_name TPNet --seed 42 \
   --batch_size 100 --learning_rate 1e-4 --num_epochs 30 --num_runs 1 \
-  --patience 10 --gpu 0 --dataset_path /data/CRAFT_v2/data/ \
+  --patience 10 --gpu 0 --dataset_path ./data/ \
   --training_mode joint_random --test_interval_epochs 1 --load_best_configs \
-  > logs/Taobao_jr.log 2>&1 &
+  > logs/Taobao_jr_s42.log 2>&1 &
 ```
-Target: > CRAFT 0.707.
+**Target**: test MRR > 0.707.
 
-### tgbn-token (DTLP α sweep)
+### C3 — tgbn-token (DTLP only — no backbone)
 ```bash
 cd /data/DTLP
 for a in 0.1 0.3 0.5 0.7 0.9; do
@@ -114,27 +105,34 @@ for a in 0.1 0.3 0.5 0.7 0.9; do
     > logs/tgbn-token_a${a}.log 2>&1 &
 done
 ```
-Target: > NAVIS 0.513.
+**Target**: NDCG@10 > 0.513.
 
-## Reporting results
+## Report
 
 Please share:
-- Best test MRR per config
-- Full log file
-- GPU used (model, hours)
+- Final test MRR (or NDCG for tgbn-token)
+- GPU used (card + hours)
+- Best config (training_mode, seed)
+- Log file
 
-Upload to Google Drive / shared folder: <TBD by team lead>.
+Post in team chat: `<dataset>_<model>_<mode>_s<seed>: best_test=0.XXX (N hours on <GPU>)`
 
-## If issues
+## Troubleshooting
 
-1. **"EOFError: EOF when reading a line"** on data download → set `builtins.input = lambda *a, **k: 'y'` before import
-2. **CUDA OOM on large datasets** → reduce `--batch_size` to 50 or 25
-3. **thgl-software protocol mismatch** → use relative `--dataset_path datasets/` (CRAFT_v2's tgb prepends PROJ_DIR which breaks absolute paths)
-4. **TPNet+PAS stuck at model init** → wait — neighbor sampler construction for 50M+ edge datasets takes 30-60 min before first log output
+1. **EOFError on first run** (data download) → run once interactively and answer `y`, or wrap: `echo y | python ...`
+2. **OOM on Yelp/WikiLink** → reduce `--batch_size` to 50 or 25
+3. **TPNet+PAS "stuck" at model init** → waiting on neighbor sampler construction for 50M+ edge datasets (30-60 min first time, cached after).
+4. **thgl-software errors** → use relative `--dataset_path datasets/` (tgb prepends PROJ_DIR to absolute paths — breaks them).
+5. **"No such test sample"** for thgl-* → ensure your CRAFT_v2 has our fix (lookup key `(time, src, edge_type)`). Already applied in this repo.
 
-## Hardware recommendations
+## Known close-gap status (lead is pushing these)
 
-- **Yelp/WikiLink/Taobao**: need 24GB VRAM (4090 or A100). 2-3 days training.
-- **ML-20M**: fits on 12GB (3090). 1 day.
-- **tgbn-token**: CPU-bound warmup (51M edges). Any GPU works, but 1-2 days total.
-- **Close-gap LP datasets**: 4090 ~3-6 hours each.
+| Dataset | Current | Target | Gap | ETA |
+|---|---|---|---|---|
+| GoogleLocal | CRAFT+PAS 0.6186 | 0.624 | -0.9% | hrs (sg mode training) |
+| tgbl-comment | DTLP 0.904 | 0.917 | -1.3% | hrs (Trick B running) |
+| tgbl-flight | TPNet+PAS 0.891 | 0.914 | -2.3% | hrs |
+| tgbl-coin | TPNet+PAS 0.786 | 0.885 | -11% | hrs |
+| thgl-software | DTLP 0.547 | 0.731 | -25% | hrs (just unblocked TPNet+PAS) |
+| tgbn-trade | DTLP 0.79 | 0.863 | -8% | ceiling confirmed — possibly paper limitation |
+
