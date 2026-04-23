@@ -24,6 +24,8 @@ from tgb.nodeproppred.dataset import NodePropPredDataset
 from tgb.nodeproppred.evaluate import Evaluator
 
 from models.TPNet import TPNet, RandomProjectionModule
+from utils.DataLoader import Data
+from utils.utils import get_neighbor_sampler
 
 
 class IncrementalNodeState:
@@ -145,23 +147,24 @@ def update_edges_until(target_time, edge_idx, edge_limit, sources, destinations,
     return edge_idx
 
 
-def compute_tpnet_node_embeddings(rp_module, node_ids):
-    # TPNet.py exposes node-wise temporal walk state through the random projection bank.
-    # For node prediction we use the concatenation of A^(0)...A^(K) as the node embedding,
-    # since there is no separate standalone node-embedding head defined for this setting.
-    node_index = torch.as_tensor(node_ids, device=rp_module.random_projections[0].device, dtype=torch.long)
+def compute_tpnet_node_embeddings(tpnet_backbone, node_ids, node_interact_times):
     with torch.no_grad():
-        layer_embeddings = [rp_module.random_projections[layer][node_index] for layer in range(rp_module.num_layer + 1)]
-        node_embeddings = torch.cat(layer_embeddings, dim=1)
+        node_embeddings, _ = tpnet_backbone.compute_src_dst_node_temporal_embeddings(
+            src_node_ids=node_ids,
+            dst_node_ids=node_ids,
+            node_interact_times=node_interact_times,
+        )
         node_embeddings = torch.nan_to_num(node_embeddings, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
     return node_embeddings.detach().cpu().numpy().astype(np.float32)
 
 
-def build_snapshot(feature_state, rp_module, labels_at_ts, num_classes, timestamp):
-    node_ids = np.asarray(sorted(labels_at_ts.keys()), dtype=np.int64)
-    labels = np.asarray([labels_at_ts[int(node_id)] for node_id in node_ids], dtype=np.float32)
+def build_snapshot(feature_state, tpnet_backbone, labels_at_ts, num_classes, timestamp, node_id_offset):
+    raw_node_ids = np.asarray(sorted(labels_at_ts.keys()), dtype=np.int64)
+    node_ids = raw_node_ids + node_id_offset
+    labels = np.asarray([labels_at_ts[int(node_id)] for node_id in raw_node_ids], dtype=np.float32)
     state_features = feature_state.get_combined_features(node_ids, timestamp)
-    tpnet_embeddings = compute_tpnet_node_embeddings(rp_module, node_ids)
+    node_interact_times = np.full(len(node_ids), timestamp, dtype=np.float64)
+    tpnet_embeddings = compute_tpnet_node_embeddings(tpnet_backbone, node_ids, node_interact_times)
     features = np.concatenate(
         [
             tpnet_embeddings,
@@ -173,7 +176,8 @@ def build_snapshot(feature_state, rp_module, labels_at_ts, num_classes, timestam
     return {"node_ids": node_ids, "features": features, "labels": labels}
 
 
-def collect_snapshots(split_timestamps, edge_idx, edge_limit, sources, destinations, timestamps, node_label_dict, state, rp_module, num_classes):
+def collect_snapshots(split_timestamps, edge_idx, edge_limit, sources, destinations, timestamps, node_label_dict, state,
+                      rp_module, tpnet_backbone, num_classes, node_id_offset):
     snapshots = []
     for ts in split_timestamps:
         t_val = float(ts)
@@ -192,7 +196,7 @@ def collect_snapshots(split_timestamps, edge_idx, edge_limit, sources, destinati
         if not labels_at_ts:
             continue
 
-        snapshot = build_snapshot(state, rp_module, labels_at_ts, num_classes, t_val)
+        snapshot = build_snapshot(state, tpnet_backbone, labels_at_ts, num_classes, t_val, node_id_offset)
         snapshots.append(snapshot)
         state.update_labels(snapshot["node_ids"], snapshot["labels"])
 
@@ -244,9 +248,9 @@ def train_and_evaluate(args):
     print(f"Loading {args.dataset}...")
     dataset = NodePropPredDataset(name=args.dataset, root="datasets")
     data = dataset.full_data
-    sources = data["sources"]
-    destinations = data["destinations"]
-    timestamps = data["timestamps"]
+    raw_sources = data["sources"].astype(np.int64)
+    raw_destinations = data["destinations"].astype(np.int64)
+    timestamps = data["timestamps"].astype(np.float64)
     if "node_label_dict" in data:
         node_label_dict = data["node_label_dict"]
     elif hasattr(dataset, "label_dict"):
@@ -264,10 +268,14 @@ def train_and_evaluate(args):
 
     first_node = next(iter(first_nonempty))
     num_classes = len(first_nonempty[first_node])
-    max_edge_node = int(max(sources.max(), destinations.max()))
+    node_id_offset = 1
+    max_edge_node = int(max(raw_sources.max(), raw_destinations.max()))
     max_label_node = max(int(max(labels_at_ts.keys())) for labels_at_ts in node_label_dict.values() if labels_at_ts)
-    num_nodes = max(max_edge_node, max_label_node) + 1
+    num_nodes = max(max_edge_node, max_label_node) + 1 + node_id_offset
+    sources = raw_sources + node_id_offset
+    destinations = raw_destinations + node_id_offset
     total_edges = len(sources)
+    edge_ids = np.arange(1, total_edges + 1, dtype=np.int64)
 
     train_end = int(dataset.train_mask.sum())
     val_end = train_end + int(dataset.val_mask.sum())
@@ -285,7 +293,20 @@ def train_and_evaluate(args):
     print(f"Train label ts: {len(train_ts)}, Val label ts: {len(val_ts)}, Test label ts: {len(test_ts)}")
 
     state = IncrementalNodeState(num_nodes=num_nodes, num_classes=num_classes, ema_alpha=args.ema_alpha)
-    _ = TPNet
+    full_graph_data = Data(
+        src_node_ids=sources,
+        dst_node_ids=destinations,
+        node_interact_times=timestamps,
+        edge_ids=edge_ids,
+        labels=np.zeros(total_edges, dtype=np.float32),
+    )
+    neighbor_sampler = get_neighbor_sampler(
+        data=full_graph_data,
+        sample_neighbor_strategy=args.sample_neighbor_strategy,
+        seed=args.seed,
+    )
+    node_raw_features = np.zeros((num_nodes, args.tpnet_feature_dim), dtype=np.float32)
+    edge_raw_features = np.zeros((total_edges + 1, 1), dtype=np.float32)
     rp_module = RandomProjectionModule(
         node_num=num_nodes,
         edge_num=total_edges,
@@ -298,8 +319,20 @@ def train_and_evaluate(args):
         not_scale=False,
         enforce_dim=-1,
     )
-    rp_module = rp_module.to(device)
-    tpnet_dim = (rp_module.num_layer + 1) * rp_module.dim
+    tpnet_backbone = TPNet(
+        node_raw_features=node_raw_features,
+        edge_raw_features=edge_raw_features,
+        neighbor_sampler=neighbor_sampler,
+        time_feat_dim=args.tpnet_time_feat_dim,
+        dropout=args.tpnet_dropout,
+        random_projections=rp_module,
+        num_layers=args.tpnet_mixer_layers,
+        num_neighbors=args.num_neighbors,
+        device=str(device),
+    ).to(device)
+    tpnet_backbone.eval()
+    rp_module = tpnet_backbone.random_projections
+    tpnet_dim = tpnet_backbone.node_feat_dim
 
     edge_idx = 0
     train_snapshots, edge_idx = collect_snapshots(
@@ -312,7 +345,9 @@ def train_and_evaluate(args):
         node_label_dict=node_label_dict,
         state=state,
         rp_module=rp_module,
+        tpnet_backbone=tpnet_backbone,
         num_classes=num_classes,
+        node_id_offset=node_id_offset,
     )
     edge_idx = update_edges_until(
         target_time=float("inf"),
@@ -337,7 +372,9 @@ def train_and_evaluate(args):
         node_label_dict=node_label_dict,
         state=state,
         rp_module=rp_module,
+        tpnet_backbone=tpnet_backbone,
         num_classes=num_classes,
+        node_id_offset=node_id_offset,
     )
     edge_idx = update_edges_until(
         target_time=float("inf"),
@@ -359,7 +396,9 @@ def train_and_evaluate(args):
         node_label_dict=node_label_dict,
         state=state,
         rp_module=rp_module,
+        tpnet_backbone=tpnet_backbone,
         num_classes=num_classes,
+        node_id_offset=node_id_offset,
     )
 
     train_features = np.concatenate([snapshot["features"] for snapshot in train_snapshots], axis=0)
@@ -425,6 +464,12 @@ if __name__ == "__main__":
     parser.add_argument("--tpnet_dim_factor", type=int, default=10)
     parser.add_argument("--tpnet_num_layer", type=int, default=2)
     parser.add_argument("--tpnet_time_decay", type=float, default=1e-6)
+    parser.add_argument("--tpnet_mixer_layers", type=int, default=2)
+    parser.add_argument("--tpnet_time_feat_dim", type=int, default=16)
+    parser.add_argument("--tpnet_feature_dim", type=int, default=128)
+    parser.add_argument("--tpnet_dropout", type=float, default=0.1)
+    parser.add_argument("--num_neighbors", type=int, default=20)
+    parser.add_argument("--sample_neighbor_strategy", type=str, default="recent")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
     train_and_evaluate(parser.parse_args())

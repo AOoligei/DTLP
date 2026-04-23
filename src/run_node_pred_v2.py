@@ -75,10 +75,15 @@ class NodePredictorV2(nn.Module):
 
 class IncrementalNodeState:
     """Tracks graph features + label history per node."""
-    def __init__(self, num_nodes, num_classes, ema_alpha=0.3):
+    def __init__(self, num_nodes, num_classes, ema_alpha=0.3,
+                 prior_strength=0.0, ema_alpha_long=None):
         self.num_nodes = num_nodes
         self.num_classes = num_classes
         self.ema_alpha = ema_alpha
+        # Trick A: James-Stein shrinkage toward global class prior (0 = off)
+        self.prior_strength = prior_strength
+        # Trick F: dual-timescale EMA — second (long) EMA; None = off
+        self.ema_alpha_long = ema_alpha_long
 
         # Graph features
         self.out_degree = np.zeros(num_nodes, dtype=np.int32)
@@ -91,6 +96,12 @@ class IncrementalNodeState:
         # Label history: exponential moving average of past labels
         self.label_ema = np.zeros((num_nodes, num_classes), dtype=np.float32)
         self.label_count = np.zeros(num_nodes, dtype=np.int32)
+        # Global (running) class prior — only updated post-snapshot
+        self.global_label_ema = np.zeros(num_classes, dtype=np.float32)
+        self.global_updates = 0
+        # Dual-timescale: long-horizon per-node EMA
+        if ema_alpha_long is not None:
+            self.label_ema_long = np.zeros((num_nodes, num_classes), dtype=np.float32)
 
     def update_edge(self, src, dst, t):
         self.out_degree[src] += 1
@@ -110,10 +121,24 @@ class IncrementalNodeState:
             nid = int(nid)
             if self.label_count[nid] == 0:
                 self.label_ema[nid] = labels[i]
+                if self.ema_alpha_long is not None:
+                    self.label_ema_long[nid] = labels[i]
             else:
                 self.label_ema[nid] = (1 - self.ema_alpha) * self.label_ema[nid] + \
                                        self.ema_alpha * labels[i]
+                if self.ema_alpha_long is not None:
+                    self.label_ema_long[nid] = (1 - self.ema_alpha_long) * self.label_ema_long[nid] + \
+                                               self.ema_alpha_long * labels[i]
             self.label_count[nid] += 1
+        # Update global class prior (post-snapshot to avoid leakage)
+        if self.prior_strength > 0.0:
+            snap_mean = labels.mean(axis=0)
+            if self.global_updates == 0:
+                self.global_label_ema = snap_mean.astype(np.float32)
+            else:
+                self.global_label_ema = ((1 - self.ema_alpha) * self.global_label_ema +
+                                          self.ema_alpha * snap_mean).astype(np.float32)
+            self.global_updates += 1
 
     def get_node_features(self, node, t):
         """6-dim structural features."""
@@ -129,13 +154,25 @@ class IncrementalNodeState:
         ], dtype=np.float32)
 
     def get_combined_features(self, node_ids, t):
-        """Returns (n, num_classes + 6) feature matrix."""
+        """Returns feature matrix.
+        Base shape: (n, num_classes + 6).
+        Trick F (dual-timescale): (n, 2*num_classes + 6) — appends short-long delta.
+        """
         n = len(node_ids)
-        feats = np.zeros((n, self.num_classes + 6), dtype=np.float32)
+        use_dual = self.ema_alpha_long is not None
+        feat_dim = self.num_classes + 6 + (self.num_classes if use_dual else 0)
+        feats = np.zeros((n, feat_dim), dtype=np.float32)
         for i, nid in enumerate(node_ids):
             nid = int(nid)
-            feats[i, :self.num_classes] = self.label_ema[nid]
-            feats[i, self.num_classes:] = self.get_node_features(nid, t)
+            if self.prior_strength > 0.0 and self.global_updates > 0:
+                w = self.label_count[nid] / (self.label_count[nid] + self.prior_strength)
+                feats[i, :self.num_classes] = w * self.label_ema[nid] + (1 - w) * self.global_label_ema
+            else:
+                feats[i, :self.num_classes] = self.label_ema[nid]
+            feats[i, self.num_classes:self.num_classes + 6] = self.get_node_features(nid, t)
+            if use_dual:
+                # long-horizon EMA concat
+                feats[i, self.num_classes + 6:] = self.label_ema_long[nid]
         return feats
 
 
@@ -184,7 +221,13 @@ def train_and_evaluate(args):
     print(f"  Train: {train_end}, Val: {val_end-train_end}, Test: {total-val_end}")
 
     # 2. Build state
-    state = IncrementalNodeState(num_nodes, num_classes, ema_alpha=args.ema_alpha)
+    state = IncrementalNodeState(
+        num_nodes, num_classes,
+        ema_alpha=args.ema_alpha,
+        prior_strength=getattr(args, 'prior_strength', 0.0),
+        ema_alpha_long=getattr(args, 'ema_alpha_long', None),
+    )
+    use_dual = getattr(args, 'ema_alpha_long', None) is not None
 
     # Process training edges and labels
     print(f"\nProcessing training edges and labels...")
@@ -238,9 +281,11 @@ def train_and_evaluate(args):
     print(f"  Training samples: {n_train} ({time.time()-t0:.1f}s)")
 
     # Normalize structural features only (label EMA already in [0,1])
-    struct_mean = train_feats[:, num_classes:].mean(0)
-    struct_std = train_feats[:, num_classes:].std(0) + 1e-8
-    train_feats[:, num_classes:] = (train_feats[:, num_classes:] - struct_mean) / struct_std
+    # Dual-timescale (Trick F): layout is [label_ema(C) | struct(6) | label_ema_long(C)]
+    struct_lo, struct_hi = num_classes, num_classes + 6
+    struct_mean = train_feats[:, struct_lo:struct_hi].mean(0)
+    struct_std = train_feats[:, struct_lo:struct_hi].std(0) + 1e-8
+    train_feats[:, struct_lo:struct_hi] = (train_feats[:, struct_lo:struct_hi] - struct_mean) / struct_std
 
     # Normalize labels
     label_sums = train_labels.sum(axis=1, keepdims=True)
@@ -248,7 +293,9 @@ def train_and_evaluate(args):
     train_labels_norm = train_labels / label_sums
 
     # 3. Model
-    model = NodePredictorV2(num_classes, struct_feat_dim=6,
+    extra_feat_dim = num_classes if use_dual else 0
+    model = NodePredictorV2(num_classes,
+                            struct_feat_dim=6 + extra_feat_dim,
                             hidden_dim=args.hidden_dim, dropout=args.dropout).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Model params: {n_params:,}")
@@ -343,7 +390,7 @@ def train_and_evaluate(args):
         true_labels = np.array([labels_at_ts[n] for n in node_ids], dtype=np.float32)
 
         feats = state.get_combined_features(node_ids, t_val)
-        feats[:, num_classes:] = (feats[:, num_classes:] - struct_mean) / struct_std
+        feats[:, struct_lo:struct_hi] = (feats[:, struct_lo:struct_hi] - struct_mean) / struct_std
 
         with torch.no_grad():
             logits = model(torch.FloatTensor(feats).to(device))
@@ -372,9 +419,14 @@ def train_and_evaluate(args):
         "n_params": n_params,
         "ema_alpha": args.ema_alpha,
     }
-    os.makedirs("/data/chenlibin/TGB2/results", exist_ok=True)
+    # Save results to writable location. Prefer /data/chenlibin/TGB2/results
+    # (local) or fallback to ./results (for remote hosts without that path).
+    default_result = "/data/chenlibin/TGB2/results"
+    fallback_result = os.path.join(os.getcwd(), "results")
+    results_dir = default_result if os.access(os.path.dirname(default_result), os.W_OK) else fallback_result
+    os.makedirs(results_dir, exist_ok=True)
     out_path = get_safe_result_path(
-        "/data/chenlibin/TGB2/results",
+        results_dir,
         f"{args.dataset}_nodev2_seed{args.seed}",
     )
     with open(out_path, "w") as f:
@@ -394,5 +446,9 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--ema_alpha", type=float, default=0.3,
                         help="EMA decay for label history")
+    parser.add_argument("--prior_strength", type=float, default=0.0,
+                        help="Trick A: James-Stein shrink per-node EMA toward global class prior. 0=off. Good values: 1.0-10.0 on sparse-snapshot tasks (tgbn-trade).")
+    parser.add_argument("--ema_alpha_long", type=float, default=None,
+                        help="Trick F: dual-timescale EMA — separate long-horizon EMA alpha. None=off. Typical: 0.1 with ema_alpha=0.6 for short.")
     args = parser.parse_args()
     train_and_evaluate(args)

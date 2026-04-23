@@ -53,6 +53,28 @@ def get_safe_result_path(base_dir, stem):
         suffix += 1
 
 
+def load_cached_state(cache_path):
+    try:
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError, AttributeError, ValueError) as exc:
+        print(f"  Cache at {cache_path} is unreadable ({exc.__class__.__name__}: {exc}). Rebuilding warmup state.")
+        return None
+
+
+def atomic_pickle_dump(obj, cache_path):
+    tmp_path = f"{cache_path}.tmp.{os.getpid()}.{time.time_ns()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, cache_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def validate_args(args):
     """Fail fast on settings that otherwise crash later or produce NaNs."""
     if args.epochs < 1:
@@ -230,21 +252,29 @@ class IncrementalState:
         feats[:, 5] = np.log1p(self.n_neighbors)
         return feats
 
-    def get_pair_features(self, src, dst, rel):
-        """4-dim sparse pair features. Uses EMA if ema_decay > 0."""
+    def get_pair_features(self, src, dst, rel, t=None):
+        """4-dim (or 5-dim if Trick B on) sparse pair features.
+        Trick B: adds log(t - pair_last_time(s,d)) as 5th feature, -1 if unseen."""
+        use_recency = getattr(self, 'pair_recency_feat', False) and t is not None
         if getattr(self, 'ema_decay', 0) > 0:
-            return np.array([
+            base = [
                 self.triple_ema.get((src, dst, rel), 0.0),
                 self.pair_ema.get((src, dst), 0.0),
                 self.pair_ema.get((dst, src), 0.0),
                 self.rel_dst_ema.get((rel, dst), 0.0),
-            ], dtype=np.float32)
-        return np.array([
-            np.log1p(self.triple_count.get((src, dst, rel), 0)),
-            np.log1p(self.pair_count.get((src, dst), 0)),
-            np.log1p(self.pair_count.get((dst, src), 0)),  # reverse
-            np.log1p(self.rel_dst_count.get((rel, dst), 0)),
-        ], dtype=np.float32)
+            ]
+        else:
+            base = [
+                np.log1p(self.triple_count.get((src, dst, rel), 0)),
+                np.log1p(self.pair_count.get((src, dst), 0)),
+                np.log1p(self.pair_count.get((dst, src), 0)),
+                np.log1p(self.rel_dst_count.get((rel, dst), 0)),
+            ]
+        if use_recency:
+            last_t = self.pair_last_time.get((src, dst))
+            sd_rec = np.log1p(max(0.0, t - last_t)) if last_t is not None else -1.0
+            base.append(sd_rec)
+        return np.array(base, dtype=np.float32)
 
     def get_pair_features_all_dsts(self, src, rel, num_nodes):
         """Get pair features for (src, rel, *) for ALL destination candidates.
@@ -407,22 +437,36 @@ def train_and_evaluate(args):
     os.makedirs(cache_dir, exist_ok=True)
     ema_tag = f"_ema{args.ema_decay}" if args.ema_decay > 0 else ""
     reorder_tag = "_reordered" if not is_prefix else ""
-    cache_key = f"{args.dataset}_warmup{warmup_end}_n{num_nodes}{ema_tag}{reorder_tag}"
+    cache_key = f"{args.dataset}_warmup{warmup_end}_n{num_nodes}{ema_tag}{reorder_tag}_seed{args.seed}"
     cache_path = os.path.join(cache_dir, f"{cache_key}_state.pkl")
 
     if os.path.exists(cache_path):
         print(f"\nLoading cached warmup state from {cache_path}...")
         t0 = time.time()
-        with open(cache_path, "rb") as f:
-            state = pickle.load(f)
-        # Backward compat: add pair_last_time if missing from old cache
-        if not hasattr(state, 'pair_last_time'):
-            print("  (Rebuilding pair_last_time from warmup — old cache format)")
-            state.pair_last_time = defaultdict(lambda: -1e9)
+        cached_state = load_cached_state(cache_path)
+        if cached_state is not None:
+            state = cached_state
+            # Backward compat: add pair_last_time if missing from old cache
+            # Use plain dict (not defaultdict with lambda) so state is pickle-safe
+            # for later snapshot at line ~801. get_pair_features uses .get() to handle missing.
+            if not hasattr(state, 'pair_last_time'):
+                print("  (Rebuilding pair_last_time from warmup — old cache format)")
+                state.pair_last_time = {}
+                for i in range(warmup_end):
+                    s_tmp, d_tmp, t_tmp = int(sources[i]), int(destinations[i]), float(timestamps[i])
+                    state.pair_last_time[(s_tmp, d_tmp)] = t_tmp
+            print(f"  Loaded in {time.time()-t0:.1f}s")
+        else:
+            os.makedirs(cache_dir, exist_ok=True)
+            print(f"\nWarming up on first {warmup_end} edges...")
+            t0 = time.time()
             for i in range(warmup_end):
-                s_tmp, d_tmp, t_tmp = int(sources[i]), int(destinations[i]), float(timestamps[i])
-                state.pair_last_time[(s_tmp, d_tmp)] = t_tmp
-        print(f"  Loaded in {time.time()-t0:.1f}s")
+                state.update(int(sources[i]), int(destinations[i]),
+                             float(timestamps[i]), int(ets[i]))
+            print(f"  Done in {time.time()-t0:.1f}s")
+            print(f"  Saving state cache to {cache_path}...")
+            atomic_pickle_dump(state, cache_path)
+            print(f"  Saved.")
     else:
         print(f"\nWarming up on first {warmup_end} edges...")
         t0 = time.time()
@@ -432,8 +476,7 @@ def train_and_evaluate(args):
         print(f"  Done in {time.time()-t0:.1f}s")
         # Save cache
         print(f"  Saving state cache to {cache_path}...")
-        with open(cache_path, "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        atomic_pickle_dump(state, cache_path)
         print(f"  Saved.")
 
     # Type-constrained negative candidates
@@ -539,7 +582,8 @@ def train_and_evaluate(args):
     t0 = time.time()
 
     entity_feat_dim = 6
-    pair_feat_dim = 4
+    pair_feat_dim = 5 if getattr(args, 'pair_recency_feat', False) else 4
+    state.pair_recency_feat = getattr(args, 'pair_recency_feat', False)
 
     train_src_feats = np.zeros((n_train, entity_feat_dim), dtype=np.float32)
     train_dst_feats = np.zeros((n_train, entity_feat_dim), dtype=np.float32)
@@ -559,7 +603,7 @@ def train_and_evaluate(args):
 
         train_src_feats[i] = state.get_entity_features(s, t_i)
         train_dst_feats[i] = state.get_entity_features(d, t_i)
-        train_pair_feats[i] = state.get_pair_features(s, d, r)
+        train_pair_feats[i] = state.get_pair_features(s, d, r, t_i)
         train_rels[i] = r
 
         # Negatives: mix of random and hard (from historical neighbors of s)
@@ -614,7 +658,7 @@ def train_and_evaluate(args):
                 nd = np.random.randint(num_nodes)
             nd = int(nd)
             train_neg_dst_feats[i, k] = state.get_entity_features(nd, t_i)
-            train_neg_pair_feats[i, k] = state.get_pair_features(s, nd, r)
+            train_neg_pair_feats[i, k] = state.get_pair_features(s, nd, r, t_i)
 
         state.update(s, d, t_i, r)
 
@@ -869,7 +913,7 @@ def train_and_evaluate(args):
                     rel_t = torch.LongTensor(np.full(n_cand, ve)).to(device)
                     pf = np.zeros((n_cand, pair_feat_dim), dtype=np.float32)
                     for j, cd in enumerate(cand_dsts):
-                        pf[j] = state.get_pair_features(vs, int(cd), ve)
+                        pf[j] = state.get_pair_features(vs, int(cd), ve, vt)
                     pf = (pf - pair_mean) / pair_std
                     if args.rel_aware_pairs:
                         pf[:, 1] = 0; pf[:, 2] = 0
@@ -921,7 +965,7 @@ def train_and_evaluate(args):
                     rel_t = torch.LongTensor(np.full(n_cand, q_rel)).to(device)
                     pf = np.zeros((n_cand, pair_feat_dim), dtype=np.float32)
                     for j, cd in enumerate(cand_dsts):
-                        pf[j] = state.get_pair_features(q_src, int(cd), q_rel)
+                        pf[j] = state.get_pair_features(q_src, int(cd), q_rel, float(q_ts))
                     pf = (pf - pair_mean) / pair_std
                     if args.rel_aware_pairs:
                         pf[:, 1] = 0; pf[:, 2] = 0
@@ -1022,7 +1066,7 @@ def train_and_evaluate(args):
                     rel_t = torch.LongTensor(np.full(n_cand, ve)).to(device)
                     pf = np.zeros((n_cand, pair_feat_dim), dtype=np.float32)
                     for j, cd in enumerate(cand_dsts):
-                        pf[j] = state.get_pair_features(vs, int(cd), ve)
+                        pf[j] = state.get_pair_features(vs, int(cd), ve, vt)
                     pf = (pf - pair_mean) / pair_std
                     if args.rel_aware_pairs:
                         pf[:, 1] = 0; pf[:, 2] = 0
@@ -1130,6 +1174,8 @@ if __name__ == "__main__":
                         help='Loss function: bpr (default), ce (cross-entropy), margin (hinge)')
     parser.add_argument('--auto', action='store_true',
                         help='Auto-adapt: compute dataset stats and select best config')
+    parser.add_argument('--pair_recency_feat', action='store_true',
+                        help='Trick B: add log(t - pair_last_time(s,d)) as 5th pair feature (default off for backward compat)')
     args = parser.parse_args()
 
     if args.auto:
