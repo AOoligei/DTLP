@@ -135,3 +135,73 @@ Three highest-expected-value directions for the collaborator:
 3. **Large grid for tgbn-token** (small model, seconds per config): sweep `ema_alpha × hidden_dim × seed` over ~500 combos to find global optimum.
 
 Refer to the ρ threshold rule above: ρ < 10% → aggressive trick B + high `hard_neg_ratio`; ρ > 40% → keep hard-neg near zero.
+
+### Reference commands
+
+**(A) TGB-Seq DTLP with trick B + hard-neg sweep (Yelp / Taobao / ML-20M / WikiLink / GoogleLocal):**
+```bash
+cd /path/to/DTLP
+for hnr in 0.05 0.10 0.15 0.20 0.25 0.30; do
+  python src/run_tgbseq.py \
+    --dataset Yelp --seed 42 --loss ce \
+    --hard_neg_ratio $hnr --pair_recency_feat \
+    --gpu 0 --epochs 30 \
+    > logs/tgbseq_Yelp_ce_hnr${hnr}_trickB.log 2>&1
+done
+```
+
+**(B) tgbn-token large grid (small model, seconds per config):**
+```bash
+for seed in 42 43 44 45 46; do
+  for alpha in 0.3 0.5 0.7 0.9; do
+    for hd in 256 512 1024 2048; do
+      python src/run_node_pred_v2.py \
+        --dataset tgbn-token --seed $seed \
+        --ema_alpha $alpha --hidden_dim $hd \
+        --gpu 0 --epochs 100 \
+        > logs/tgbn-token_s${seed}_a${alpha}_h${hd}.log 2>&1
+    done
+  done
+done
+```
+
+**(C) Backbone swap — TGN / DyGFormer / GraphMixer + PAS (for Yelp / Taobao / WikiLink):**
+```bash
+cd external/craft_v2
+for model in TGN DyGFormer GraphMixer; do
+  python train_link_prediction.py \
+    --dataset_name Yelp --model_name $model --seed 42 \
+    --batch_size 100 --learning_rate 1e-4 --num_epochs 30 \
+    --num_runs 1 --patience 10 --gpu 0 \
+    --dataset_path ./data/ \
+    --training_mode joint_random --test_interval_epochs 1 \
+    --load_best_configs \
+    > logs/Yelp_${model}PAS_jr_s42.log 2>&1
+done
+```
+
+**(D) Aggressive TPNet+PAS on large GPU:**
+```bash
+cd external/craft_v2
+python train_link_prediction.py \
+  --dataset_name Yelp --model_name TPNet --seed 42 \
+  --batch_size 400 --learning_rate 1e-4 --num_epochs 30 \
+  --num_runs 1 --patience 10 --gpu 0 \
+  --dataset_path ./data/ \
+  --training_mode joint_random --test_interval_epochs 1 \
+  --load_best_configs \
+  --embedding_size 384 --num_neighbors 90 \
+  > logs/Yelp_TPNETPAS_jr_s42_emb384nn90.log 2>&1
+```
+
+**(E) thgl-software CRAFT+PAS (this recipe got us 0.5849):**
+```bash
+cd external/craft_v2
+python train_link_prediction.py \
+  --dataset_name thgl-software --model_name CRAFT --seed 42 \
+  --batch_size 200 --learning_rate 1e-4 --num_epochs 100 \
+  --num_runs 1 --patience 10 --gpu 0 \
+  --dataset_path datasets/ \
+  --training_mode joint_random --load_best_configs \
+  > logs/thgl-software_CRAFTPAS_jr_s42.log 2>&1
+```
