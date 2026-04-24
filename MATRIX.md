@@ -4,19 +4,21 @@ Live status of 11 gap datasets × 4 method columns. Last updated 2026-04-24.
 
 ## Current standings
 
-| Dataset | Type | Our best | Reference SOTA | Gap | Owner |
-|---------|------|----------|----------------|-----|-------|
-| **tgbl-comment** | LP | **0.9188** | CRAFT 0.917 | **+0.2% ✅ SOTA** | lead |
-| tgbl-flight | LP | 0.8844 | TGN 0.914 | -3.2% | lead |
-| tgbl-coin | LP | **0.8271** | CRAFT 0.885 | -6.5% | lead |
-| GoogleLocal | LP (TGB-Seq) | 0.6186 | CRAFT 0.624 | -0.9% | collaborator |
-| tgbn-trade | NODE | 0.7953 | 0.863 | -7.8% | collaborator |
-| ML-20M | LP (TGB-Seq) | 0.3110 | CRAFT 0.359 | -13.4% | collaborator |
-| thgl-software | LP (THG) | **0.5849** | STHN 0.731 | -20.0% | collaborator |
-| WikiLink | LP (TGB-Seq) | 0.5862 | CRAFT 0.755 | -22.4% | collaborator |
-| tgbn-token | NODE | 0.3886 | NAVIS 0.513 | -24.2% | collaborator |
-| Taobao | LP (TGB-Seq) | 0.4316 | CRAFT 0.707 | -39.0% | collaborator |
-| Yelp | LP (TGB-Seq) | 0.3805 | CRAFT 0.727 | -47.7% | collaborator |
+ρ column = test-pair recurrence rate (what fraction of test pairs appear in train+val). Low ρ typically benefits from trick B + high `hard_neg_ratio`; high ρ typically does not.
+
+| Dataset | Type | ρ | Our best | Reference SOTA | Gap | Owner |
+|---------|------|---|----------|----------------|-----|-------|
+| **tgbl-comment** | LP | 6.13% | **0.9188** | CRAFT 0.917 | **+0.2% ✅ SOTA** | lead |
+| tgbl-flight | LP | 96.76% | 0.8844 | TGN 0.914 | -3.2% | lead |
+| tgbl-coin | LP | 70.96% | **0.8271** | CRAFT 0.885 | -6.5% | lead |
+| GoogleLocal | LP (TGB-Seq) | 0.00% | 0.6186 | CRAFT 0.624 | -0.9% | collaborator |
+| tgbn-trade | NODE | 96.80% | 0.7953 | 0.863 | -7.8% | collaborator |
+| ML-20M | LP (TGB-Seq) | 0.00% | 0.3110 | CRAFT 0.359 | -13.4% | collaborator |
+| thgl-software | LP (THG) | 23.07% | **0.5849** | STHN 0.731 | -20.0% | collaborator |
+| WikiLink | LP (TGB-Seq) | 0.00% | 0.5862 | CRAFT 0.755 | -22.4% | collaborator |
+| tgbn-token | NODE | 61.87% | 0.3886 | NAVIS 0.513 | -24.2% | collaborator |
+| Taobao | LP (TGB-Seq) | 9.67% | 0.4316 | CRAFT 0.707 | -39.0% | collaborator |
+| Yelp | LP (TGB-Seq) | 5.70% | 0.3805 | CRAFT 0.727 | -47.7% | collaborator |
 
 ## Method × Dataset matrix
 
