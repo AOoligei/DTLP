@@ -87,3 +87,51 @@ Total ~60+ live procs at any time. Scanner: `bash scripts/check_gap.sh` for late
 3. **thgl-software CRAFT+PAS 0.5849 beats our own DTLP 0.547 by +7.1%** — confirms DTLP is a diagnostic probe and backbone+PAS gives headroom when DTLP plateaus.
 4. **tgbn-trade ceiling 0.7953** (smaller models outperform larger; data-sparsity bounded).
 5. **Trick-B effectiveness depends on ρ threshold** — ~10% recurrence-rate boundary confirmed.
+
+---
+
+## Parameter tuning guide (for the collaborator)
+
+### DTLP — link prediction (`src/run_tgbseq.py` for TGB-Seq, `src/run_tkg_hybrid.py` for tgbl-*/thgl-*)
+
+Main knobs, ordered by empirical importance:
+
+| Parameter | Default | How to tune |
+|-----------|---------|-------------|
+| `--hard_neg_ratio` | 0.0 | **Most important**. Low-ρ datasets (Yelp, Taobao, ML-20M, tgbn-token, tgbn-trade): try {0.10, 0.15, 0.20, 0.25, 0.30}. High-ρ datasets: try {0, 0.05}. |
+| `--pair_recency_feat` | off | **Trick B, core winner**. Almost always enable. |
+| `--loss` | bpr | Also try `ce` and `margin`. Low-ρ + hard-neg usually prefers `ce`. |
+| `--hidden_dim` | 64 | Try 128 / 256 / 512 on larger GPUs. |
+| `--repeat_profile_feat` | off | Trick I — repeat-count profile. |
+| `--cold_start_feat` | off | Trick C — cold-start indicator (TGB-Seq only). |
+| `--inv_freq_weight` | off | Trick F — inverse-frequency weighting. |
+| `--ema_decay` | — | If plateauing, try 0.05 / 0.10. |
+
+### DTLP — node prediction (`src/run_node_pred_v2.py` for tgbn-*)
+
+| Parameter | Default | How to tune |
+|-----------|---------|-------------|
+| `--ema_alpha` | 0.5 | Try {0.3, 0.5, 0.7, 0.9}. More important than `hard_neg_ratio` here. |
+| `--hidden_dim` | 256 | Try {512, 1024, 2048}. |
+| `--seed` | 42 | Multi-seed: 42, 43, 44, 45, 46. |
+
+### Backbone + PAS (`train_link_prediction.py` under `external/craft_v2/`)
+
+| Parameter | Default / recommended | How to tune |
+|-----------|-----------------------|-------------|
+| `--model_name` | TPNet or CRAFT | **Can swap to any DyGLib backbone**: TGN / DyGFormer / GraphMixer / TCL / TGAT. PAS is activated by `--training_mode`, independent of backbone. |
+| `--training_mode` | joint_random | Also try `decoupled_stopgrad` and `joint_heuristic`. |
+| `--embedding_size` | 172 | Aggressive: 256 / 384 / 512. |
+| `--num_neighbors` | 20 | Aggressive: 60 / 90 / 120. |
+| `--batch_size` | official per-dataset | **Do not reduce**. On larger GPUs, try `--batch_size 400`. |
+| `--seed` | 42 | Multi-seed for robustness. |
+
+### Where to start (recommendation)
+
+Three highest-expected-value directions for the collaborator:
+
+1. **Swap backbone + PAS** (highest breakthrough potential on Yelp / Taobao / WikiLink): `--model_name TGN`, `--model_name DyGFormer`, `--model_name GraphMixer` all compose with `--training_mode joint_random` to get backbone+PAS variants beyond TPNet/CRAFT.
+2. **Systematic trick-B + hard_neg sweep** (worked for tgbl-coin 0.813 → 0.827): for each target dataset, sweep `hard_neg_ratio` over {0.05, 0.10, 0.15, 0.20, 0.25, 0.30} with `--pair_recency_feat` on and `--loss ce`.
+3. **Large grid for tgbn-token** (small model, seconds per config): sweep `ema_alpha × hidden_dim × seed` over ~500 combos to find global optimum.
+
+Refer to the ρ threshold rule above: ρ < 10% → aggressive trick B + high `hard_neg_ratio`; ρ > 40% → keep hard-neg near zero.
