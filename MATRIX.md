@@ -82,6 +82,12 @@ Collaborator runs on their own machine, completely independent. Datasets auto-do
 
 Total ~60+ live procs at any time. Scanner: `bash scripts/check_gap.sh` for latest best-per-dataset snapshot.
 
+## Outstanding experiment TODOs (for submission round)
+
+- **TGAT + joint-random on tgbl-comment** — needed to complete the "Same-backbone causal comparison" (`tab:main`) with a clean baseline for the medium-$\rho$ regime. Current paper cell is "--" with a footnote saying the DTLP probe gives 0.675 so pathway-aligned gain is at least $+26\%$; a real TGAT joint-random run would tighten this claim. Config: TGAT + dual-path predictor, $\lambda{=}0.25$, joint-random sampler, seeds 42/43/44.
+- **TPNet + PAS on tgbn-token and tgbn-trade** — the `tab:nodepred` row for our method has NDCG via DTLP only; a backbone+PAS comparison would strengthen the extension-to-node-pred story.
+- **PRF ablation on more mid-$\rho$ datasets** — we have wiki (70.9%), comment (6.1%), coin (70.9%). A clean ablation at $\rho\in\{25\%, 40\%\}$ (thgl-software / tkgl-smallpedia) would fill the middle.
+
 ## Key findings so far
 
 1. **tgbl-comment 0.9188 beats CRAFT 0.917 by +0.2%** via DTLP with trick B + hnr=0.20 + ema=0.10.
