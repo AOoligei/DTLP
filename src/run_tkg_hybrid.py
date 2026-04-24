@@ -83,6 +83,8 @@ def validate_args(args):
         raise ValueError("--batch_size must be >= 1.")
     if args.n_neg < 1:
         raise ValueError("--n_neg must be >= 1.")
+    if args.tau <= 0:
+        raise ValueError("--tau must be > 0.")
 
 
 class HybridTKGScorer(nn.Module):
@@ -96,12 +98,23 @@ class HybridTKGScorer(nn.Module):
     """
 
     def __init__(self, num_relations, entity_feat_dim, pair_feat_dim=4,
-                 rel_dim=32, hidden_dim=64, dropout=0.1):
+                 rel_dim=32, hidden_dim=64, dropout=0.1,
+                 num_nodes=0, id_dim=0):
         super().__init__()
+        self.id_dim = id_dim
+        self.num_nodes = num_nodes
 
         # Relation embeddings
         self.rel_emb = nn.Embedding(num_relations, rel_dim)
         nn.init.xavier_uniform_(self.rel_emb.weight)
+
+        # Trick C: scalar node-id residual embedding (memorization term)
+        # bilinear s_id = emb[src] · emb[dst], ~num_nodes * id_dim params
+        if id_dim > 0 and num_nodes > 0:
+            self.node_emb = nn.Embedding(num_nodes, id_dim)
+            nn.init.zeros_(self.node_emb.weight)
+        else:
+            self.node_emb = None
 
         # Entity feature scorer: entity_feats + rel_emb → scalar
         self.entity_scorer = nn.Sequential(
@@ -129,7 +142,7 @@ class HybridTKGScorer(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, src_feats, dst_feats, rel_ids, pair_feats):
+    def forward(self, src_feats, dst_feats, rel_ids, pair_feats, src_ids=None, dst_ids=None):
         """Score specific (src, rel, dst) triplets.
 
         Args:
@@ -137,6 +150,7 @@ class HybridTKGScorer(nn.Module):
             dst_feats: (B, entity_feat_dim)
             rel_ids: (B,)
             pair_feats: (B, pair_feat_dim)
+            src_ids, dst_ids: (B,) LongTensor for Trick C node-id embedding
         Returns:
             scores: (B,)
         """
@@ -154,7 +168,14 @@ class HybridTKGScorer(nn.Module):
         pair_input = torch.cat([pair_feats, rel], dim=-1)
         pair_score = self.pair_scorer(pair_input).squeeze(-1)  # (B,)
 
-        return dst_score + src_score + pair_score
+        total = dst_score + src_score + pair_score
+
+        # Trick C: scalar node-id bilinear residual
+        if self.node_emb is not None and src_ids is not None and dst_ids is not None:
+            id_score = (self.node_emb(src_ids) * self.node_emb(dst_ids)).sum(dim=-1)
+            total = total + id_score
+
+        return total
 
 
 class IncrementalState:
@@ -170,6 +191,8 @@ class IncrementalState:
         self.last_time_dst = np.full(num_nodes, -1e9)
         self.n_relations = np.zeros(num_nodes, dtype=np.int32)
         self.n_neighbors = np.zeros(num_nodes, dtype=np.int32)
+        self.unique_out = np.zeros(num_nodes, dtype=np.int32)
+        self.unique_in = np.zeros(num_nodes, dtype=np.int32)
         self._rel_sets = [set() for _ in range(num_nodes)]
         self._nbr_sets = [set() for _ in range(num_nodes)]
 
@@ -183,6 +206,7 @@ class IncrementalState:
         self.rel_dst_ema = defaultdict(float)
         # Source-indexed for O(K) per-query pair scoring
         self.src_dsts = defaultdict(set)       # src → {dst, ...}
+        self.dst_srcs = defaultdict(set)       # dst → {src, ...}
         self.src_rel_dsts = defaultdict(set)   # (src, rel) → {dst, ...}
         # Per-pair last interaction time (for collision-aware sampling)
         self.pair_last_time = {}               # (src, dst) → last_t
@@ -220,28 +244,48 @@ class IncrementalState:
             self.triple_ema[(src, dst, rel)] = (1-alpha) * self.triple_ema[(src, dst, rel)] + alpha
             self.pair_ema[(src, dst)] = (1-alpha) * self.pair_ema[(src, dst)] + alpha
             self.rel_dst_ema[(rel, dst)] = (1-alpha) * self.rel_dst_ema[(rel, dst)] + alpha
-        self.src_dsts[src].add(dst)
+        if dst not in self.src_dsts[src]:
+            self.src_dsts[src].add(dst)
+            self.unique_out[src] += 1
+        if src not in self.dst_srcs[dst]:
+            self.dst_srcs[dst].add(src)
+            self.unique_in[dst] += 1
         self.src_rel_dsts[(src, rel)].add(dst)
 
         self.current_time = t
         self.num_edges += 1
 
     def get_entity_features(self, node, t):
-        """6-dim per-entity features."""
+        """Default 8-dim per-entity features, 9-dim with cold_start + repeat_profile."""
         src_rec = t - self.last_time_src[node]
         dst_rec = t - self.last_time_dst[node]
-        return np.array([
+        rep_out = rep_in = 0.0
+        if getattr(self, 'repeat_profile_feat', False):
+            rep_out = np.log1p(max(0, self.out_degree[node] - self.unique_out[node]))
+            rep_in = np.log1p(max(0, self.in_degree[node] - self.unique_in[node]))
+        cold = 1.0 if self.out_degree[node] == 0 else 0.0
+        feats = [
             np.log1p(self.out_degree[node]),
             np.log1p(self.in_degree[node]),
             np.log1p(max(0, src_rec)) if src_rec < 1e8 else -1.0,
             np.log1p(max(0, dst_rec)) if dst_rec < 1e8 else -1.0,
             np.log1p(self.n_relations[node]),
             np.log1p(self.n_neighbors[node]),
-        ], dtype=np.float32)
+        ]
+        if getattr(self, 'cold_start_feat', False) and getattr(self, 'repeat_profile_feat', False):
+            feats.extend([cold, rep_out, rep_in])
+        elif getattr(self, 'cold_start_feat', False):
+            feats.extend([cold, 0.0])
+        else:
+            feats.extend([rep_out, rep_in])
+        return np.array(feats, dtype=np.float32)
 
     def get_all_entity_features(self, t):
-        """Vectorized 6-dim features for ALL entities."""
-        feats = np.zeros((self.num_nodes, 6), dtype=np.float32)
+        """Vectorized entity features for ALL entities."""
+        use_cold = getattr(self, 'cold_start_feat', False)
+        use_repeat = getattr(self, 'repeat_profile_feat', False)
+        feat_dim = 8 + int(use_cold and use_repeat)
+        feats = np.zeros((self.num_nodes, feat_dim), dtype=np.float32)
         feats[:, 0] = np.log1p(self.out_degree)
         feats[:, 1] = np.log1p(self.in_degree)
         src_rec = t - self.last_time_src
@@ -250,12 +294,23 @@ class IncrementalState:
         feats[:, 3] = np.where(dst_rec < 1e8, np.log1p(np.maximum(0, dst_rec)), -1.0)
         feats[:, 4] = np.log1p(self.n_relations)
         feats[:, 5] = np.log1p(self.n_neighbors)
+        if use_cold and use_repeat:
+            feats[:, 6] = (self.out_degree == 0).astype(np.float32)
+            feats[:, 7] = np.log1p(np.maximum(0, self.out_degree - self.unique_out))
+            feats[:, 8] = np.log1p(np.maximum(0, self.in_degree - self.unique_in))
+        elif use_cold:
+            feats[:, 6] = (self.out_degree == 0).astype(np.float32)
+        elif use_repeat:
+            feats[:, 6] = np.log1p(np.maximum(0, self.out_degree - self.unique_out))
+            feats[:, 7] = np.log1p(np.maximum(0, self.in_degree - self.unique_in))
         return feats
 
     def get_pair_features(self, src, dst, rel, t=None):
         """4-dim (or 5-dim if Trick B on) sparse pair features.
         Trick B: adds log(t - pair_last_time(s,d)) as 5th feature, -1 if unseen."""
         use_recency = getattr(self, 'pair_recency_feat', False) and t is not None
+        pair_cnt = self.pair_count.get((src, dst), 0)
+        pair_last_t = self.pair_last_time.get((src, dst))
         if getattr(self, 'ema_decay', 0) > 0:
             base = [
                 self.triple_ema.get((src, dst, rel), 0.0),
@@ -270,9 +325,14 @@ class IncrementalState:
                 np.log1p(self.pair_count.get((dst, src), 0)),
                 np.log1p(self.rel_dst_count.get((rel, dst), 0)),
             ]
+        if getattr(self, 'pair_temp_decay', False) and t is not None:
+            if pair_last_t is None:
+                base[1] = 0.0
+            else:
+                age = max(0.0, float(t) - float(pair_last_t))
+                base[1] = np.log1p(pair_cnt * np.exp(-age / float(getattr(self, 'tau', 3600.0))))
         if use_recency:
-            last_t = self.pair_last_time.get((src, dst))
-            sd_rec = np.log1p(max(0.0, t - last_t)) if last_t is not None else -1.0
+            sd_rec = np.log1p(max(0.0, t - pair_last_t)) if pair_last_t is not None else -1.0
             base.append(sd_rec)
         return np.array(base, dtype=np.float32)
 
@@ -455,6 +515,22 @@ def train_and_evaluate(args):
                 for i in range(warmup_end):
                     s_tmp, d_tmp, t_tmp = int(sources[i]), int(destinations[i]), float(timestamps[i])
                     state.pair_last_time[(s_tmp, d_tmp)] = t_tmp
+            # Trick D backward compat: add dst_srcs + unique_out/in if missing
+            if not hasattr(state, 'dst_srcs'):
+                print("  (Rebuilding dst_srcs from src_dsts — old cache format)")
+                from collections import defaultdict as _dd
+                state.dst_srcs = _dd(set)
+                for s_tmp, dst_set in state.src_dsts.items():
+                    for d_tmp in dst_set:
+                        state.dst_srcs[d_tmp].add(s_tmp)
+            if not hasattr(state, 'unique_out') or not hasattr(state, 'unique_in'):
+                print("  (Rebuilding unique_out/unique_in from src_dsts/dst_srcs)")
+                state.unique_out = np.zeros(state.num_nodes, dtype=np.int32)
+                state.unique_in = np.zeros(state.num_nodes, dtype=np.int32)
+                for s_tmp, dst_set in state.src_dsts.items():
+                    state.unique_out[s_tmp] = len(dst_set)
+                for d_tmp, src_set in state.dst_srcs.items():
+                    state.unique_in[d_tmp] = len(src_set)
             print(f"  Loaded in {time.time()-t0:.1f}s")
         else:
             os.makedirs(cache_dir, exist_ok=True)
@@ -581,9 +657,13 @@ def train_and_evaluate(args):
     print(f"\nCollecting {n_train} trainable edges...")
     t0 = time.time()
 
-    entity_feat_dim = 6
+    entity_feat_dim = 8 + int(getattr(args, 'cold_start_feat', False) and getattr(args, 'repeat_profile_feat', False))
     pair_feat_dim = 5 if getattr(args, 'pair_recency_feat', False) else 4
     state.pair_recency_feat = getattr(args, 'pair_recency_feat', False)
+    state.repeat_profile_feat = getattr(args, 'repeat_profile_feat', False)
+    state.cold_start_feat = getattr(args, 'cold_start_feat', False)
+    state.pair_temp_decay = getattr(args, 'pair_temp_decay', False)
+    state.tau = float(args.tau)
 
     train_src_feats = np.zeros((n_train, entity_feat_dim), dtype=np.float32)
     train_dst_feats = np.zeros((n_train, entity_feat_dim), dtype=np.float32)
@@ -591,6 +671,11 @@ def train_and_evaluate(args):
     train_neg_dst_feats = np.zeros((n_train, n_neg, entity_feat_dim), dtype=np.float32)
     train_neg_pair_feats = np.zeros((n_train, n_neg, pair_feat_dim), dtype=np.float32)
     train_rels = np.zeros(n_train, dtype=np.int64)
+    # Trick C: also store src/dst IDs for node-id residual embedding
+    train_src_ids = np.zeros(n_train, dtype=np.int64)
+    train_dst_ids = np.zeros(n_train, dtype=np.int64)
+    train_neg_dst_ids = np.zeros((n_train, n_neg), dtype=np.int64)
+    train_inv_freq_w = np.ones(n_train, dtype=np.float32) if getattr(args, 'inv_freq_weight', False) else None
     filtered_collision_count = 0
     total_hard_neg_count = 0
 
@@ -605,6 +690,10 @@ def train_and_evaluate(args):
         train_dst_feats[i] = state.get_entity_features(d, t_i)
         train_pair_feats[i] = state.get_pair_features(s, d, r, t_i)
         train_rels[i] = r
+        train_src_ids[i] = s
+        train_dst_ids[i] = d
+        if train_inv_freq_w is not None:
+            train_inv_freq_w[i] = np.log(num_nodes / (1.0 + float(state.out_degree[s])))
 
         # Negatives: mix of random and hard (from historical neighbors of s)
         candidates = type_to_dsts_arr.get(r, None)
@@ -659,6 +748,7 @@ def train_and_evaluate(args):
             nd = int(nd)
             train_neg_dst_feats[i, k] = state.get_entity_features(nd, t_i)
             train_neg_pair_feats[i, k] = state.get_pair_features(s, nd, r, t_i)
+            train_neg_dst_ids[i, k] = nd
 
         state.update(s, d, t_i, r)
 
@@ -703,9 +793,11 @@ def train_and_evaluate(args):
         train_neg_pair_feats[:, :, 2] = 0
 
     # 4. Model
+    id_dim = getattr(args, 'id_dim', 0)
     model = HybridTKGScorer(
         num_relations, entity_feat_dim, pair_feat_dim,
-        rel_dim=args.rel_dim, hidden_dim=args.hidden_dim, dropout=args.dropout
+        rel_dim=args.rel_dim, hidden_dim=args.hidden_dim, dropout=args.dropout,
+        num_nodes=num_nodes, id_dim=id_dim,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel params: {n_params:,}")
@@ -716,9 +808,14 @@ def train_and_evaluate(args):
     t_src_f = torch.FloatTensor(train_src_feats).to(device)
     t_dst_f = torch.FloatTensor(train_dst_feats).to(device)
     t_pair_f = torch.FloatTensor(train_pair_feats).to(device)
+    # Trick C: pre-move ID tensors
+    t_src_ids = torch.LongTensor(train_src_ids).to(device) if id_dim > 0 else None
+    t_dst_ids = torch.LongTensor(train_dst_ids).to(device) if id_dim > 0 else None
+    t_neg_dst_ids = torch.LongTensor(train_neg_dst_ids).to(device) if id_dim > 0 else None
     t_neg_dst_f = torch.FloatTensor(train_neg_dst_feats).to(device)
     t_neg_pair_f = torch.FloatTensor(train_neg_pair_feats).to(device)
     t_rels = torch.LongTensor(train_rels).to(device)
+    t_inv_freq_w = torch.FloatTensor(train_inv_freq_w).to(device) if train_inv_freq_w is not None else None
 
     # Ablation: zero out features
     if args.ablation == 'entity_only':
@@ -752,14 +849,17 @@ def train_and_evaluate(args):
             b_pair_f = t_pair_f[idx]
             b_rels = t_rels[idx]
 
-            # Positive scores
-            pos_scores = model(b_src_f, b_dst_f, b_rels, b_pair_f)
+            # Positive scores — pass ids when Trick C on
+            b_src_ids = t_src_ids[idx] if t_src_ids is not None else None
+            b_dst_ids = t_dst_ids[idx] if t_dst_ids is not None else None
+            pos_scores = model(b_src_f, b_dst_f, b_rels, b_pair_f, b_src_ids, b_dst_ids)
 
             # Negative scores
             neg_scores_list = []
             for k in range(n_neg):
+                b_nd_ids = t_neg_dst_ids[idx, k] if t_neg_dst_ids is not None else None
                 ns = model(b_src_f, t_neg_dst_f[idx, k], b_rels,
-                          t_neg_pair_f[idx, k])
+                          t_neg_pair_f[idx, k], b_src_ids, b_nd_ids)
                 neg_scores_list.append(ns)
             neg_scores = torch.stack(neg_scores_list, dim=1)  # (B, n_neg)
 
@@ -767,19 +867,23 @@ def train_and_evaluate(args):
             if args.loss == 'bpr':
                 # BPR: pairwise log-sigmoid
                 diff = pos_scores.unsqueeze(1) - neg_scores
-                loss = -F.logsigmoid(diff).mean()
+                per_example_loss = -F.logsigmoid(diff).mean(dim=1)
             elif args.loss == 'ce':
                 # Cross-Entropy: pos should rank first among {pos, neg1..negK}
                 all_scores = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)  # (B, 1+K)
                 targets = torch.zeros(len(idx), dtype=torch.long, device=device)  # pos is index 0
-                loss = F.cross_entropy(all_scores, targets)
+                per_example_loss = F.cross_entropy(all_scores, targets, reduction='none')
             elif args.loss == 'margin':
                 # Margin-Hinge (inspired by NAVIS): max(0, δ - (pos - neg))
                 margin = 0.1
                 diff = pos_scores.unsqueeze(1) - neg_scores
-                loss = torch.clamp(margin - diff, min=0).mean()
+                per_example_loss = torch.clamp(margin - diff, min=0).mean(dim=1)
             else:
                 raise ValueError(f"Unknown loss: {args.loss}")
+            if t_inv_freq_w is not None:
+                loss = (per_example_loss * t_inv_freq_w[idx]).mean()
+            else:
+                loss = per_example_loss.mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -919,7 +1023,9 @@ def train_and_evaluate(args):
                         pf[:, 1] = 0; pf[:, 2] = 0
                     if args.ablation == 'entity_only':
                         pf[:] = 0
-                    scores = model(src_t, dst_t, rel_t, torch.FloatTensor(pf).to(device)).cpu().numpy()
+                    s_ids = torch.LongTensor(np.full(n_cand, int(vs))).to(device) if id_dim > 0 else None
+                    d_ids = torch.LongTensor(cand_dsts.astype(np.int64)).to(device) if id_dim > 0 else None
+                    scores = model(src_t, dst_t, rel_t, torch.FloatTensor(pf).to(device), s_ids, d_ids).cpu().numpy()
 
                 mrr_list.append(compute_tie_aware_mrr(scores))
                 n_eval += 1
@@ -971,7 +1077,9 @@ def train_and_evaluate(args):
                         pf[:, 1] = 0; pf[:, 2] = 0
                     if args.ablation == 'entity_only':
                         pf[:] = 0
-                    scores = model(src_t, dst_t, rel_t, torch.FloatTensor(pf).to(device)).cpu().numpy()
+                    s_ids = torch.LongTensor(np.full(n_cand, int(q_src))).to(device) if id_dim > 0 else None
+                    d_ids = torch.LongTensor(cand_dsts.astype(np.int64)).to(device) if id_dim > 0 else None
+                    scores = model(src_t, dst_t, rel_t, torch.FloatTensor(pf).to(device), s_ids, d_ids).cpu().numpy()
 
                 mrr_list.append(compute_tie_aware_mrr(scores))
                 n_eval += 1
@@ -1072,7 +1180,9 @@ def train_and_evaluate(args):
                         pf[:, 1] = 0; pf[:, 2] = 0
                     if args.ablation == 'entity_only':
                         pf[:] = 0
-                    scores = model(src_t, dst_t, rel_t, torch.FloatTensor(pf).to(device)).cpu().numpy()
+                    s_ids = torch.LongTensor(np.full(n_cand, int(vs))).to(device) if id_dim > 0 else None
+                    d_ids = torch.LongTensor(cand_dsts.astype(np.int64)).to(device) if id_dim > 0 else None
+                    scores = model(src_t, dst_t, rel_t, torch.FloatTensor(pf).to(device), s_ids, d_ids).cpu().numpy()
 
                 mrr_list.append(compute_tie_aware_mrr(scores))
 
@@ -1113,6 +1223,12 @@ def train_and_evaluate(args):
         config_parts.append(f"lr{args.lr}")
     if hasattr(args, 'n_neg') and args.n_neg != 10:
         config_parts.append(f"neg{args.n_neg}")
+    if getattr(args, 'inv_freq_weight', False):
+        config_parts.append("invfreq")
+    if getattr(args, 'cold_start_feat', False):
+        config_parts.append("cold")
+    if getattr(args, 'pair_temp_decay', False):
+        config_parts.append(f"ptd{args.tau:g}")
     config_tag = "_".join(config_parts) if config_parts else "default"
 
     result_dict = {
@@ -1125,10 +1241,18 @@ def train_and_evaluate(args):
         'n_evaluated': num_evaluated,
         'eval_time': elapsed,
         'best_epoch': best_epoch_val,
+        'inv_freq_weight': args.inv_freq_weight,
+        'cold_start_feat': args.cold_start_feat,
+        'pair_temp_decay': args.pair_temp_decay,
+        'tau': args.tau,
     }
-    os.makedirs("/data/chenlibin/TGB2/results", exist_ok=True)
+    # Save results to writable location; fallback to ./results on remote hosts
+    default_result = "/data/chenlibin/TGB2/results"
+    fallback_result = os.path.join(os.getcwd(), "results")
+    results_dir = default_result if os.access(os.path.dirname(default_result), os.W_OK) else fallback_result
+    os.makedirs(results_dir, exist_ok=True)
     out_path = get_safe_result_path(
-        "/data/chenlibin/TGB2/results",
+        results_dir,
         f"{args.dataset}_{config_tag}_seed{args.seed}",
     )
     with open(out_path, 'w') as f:
@@ -1176,6 +1300,18 @@ if __name__ == "__main__":
                         help='Auto-adapt: compute dataset stats and select best config')
     parser.add_argument('--pair_recency_feat', action='store_true',
                         help='Trick B: add log(t - pair_last_time(s,d)) as 5th pair feature (default off for backward compat)')
+    parser.add_argument('--repeat_profile_feat', action='store_true',
+                        help='Trick D: add repeated-neighbor profile features to entity features')
+    parser.add_argument('--inv_freq_weight', action='store_true',
+                        help='Trick G: weight each training example by log(num_nodes / (1 + out_degree[src]))')
+    parser.add_argument('--cold_start_feat', action='store_true',
+                        help='Trick I: add an is_cold feature for nodes with zero out-degree')
+    parser.add_argument('--pair_temp_decay', action='store_true',
+                        help='Trick J: replace pair_count with a temporally decayed count when t is available')
+    parser.add_argument('--tau', type=float, default=3600.0,
+                        help='Trick J decay constant in seconds (default: 3600)')
+    parser.add_argument('--id_dim', type=int, default=0,
+                        help='Trick C: scalar node-id bilinear residual embedding dim (0=off). Good: 1-4 on large-node datasets (coin).')
     args = parser.parse_args()
 
     if args.auto:

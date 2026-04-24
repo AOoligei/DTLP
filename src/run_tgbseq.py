@@ -53,13 +53,18 @@ def validate_args(args):
         raise ValueError("--n_neg must be >= 1.")
     if args.max_train < 1:
         raise ValueError("--max_train must be >= 1.")
+    if args.tau <= 0:
+        raise ValueError("--tau must be > 0.")
 
 
 class HybridTKGScorer(nn.Module):
     def __init__(self, num_relations, entity_feat_dim, pair_feat_dim,
-                 rel_dim=32, hidden_dim=64, dropout=0.3):
+                 rel_dim=32, hidden_dim=64, dropout=0.3, num_nodes=0, dst_bias=False):
         super().__init__()
+        self.use_dst_bias = dst_bias
         self.rel_emb = nn.Embedding(max(num_relations, 1), rel_dim)
+        self.dst_bias = nn.Embedding(num_nodes, 1)
+        nn.init.zeros_(self.dst_bias.weight)
         self.entity_scorer = nn.Sequential(
             nn.Linear(entity_feat_dim + rel_dim, hidden_dim),
             nn.ReLU(), nn.Dropout(dropout),
@@ -76,7 +81,7 @@ class HybridTKGScorer(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, src_feat, dst_feat, rels, pair_feat):
+    def forward(self, src_feat, dst_feat, rels, pair_feat, dst_ids=None):
         rel_emb = self.rel_emb(rels)
         dst_input = torch.cat([dst_feat, rel_emb], dim=-1)
         dst_score = self.entity_scorer(dst_input).squeeze(-1)
@@ -84,7 +89,10 @@ class HybridTKGScorer(nn.Module):
         src_score = self.src_scorer(src_input).squeeze(-1)
         pair_input = torch.cat([pair_feat, rel_emb], dim=-1)
         pair_score = self.pair_scorer(pair_input).squeeze(-1)
-        return dst_score + src_score + pair_score
+        total = dst_score + src_score + pair_score
+        if self.use_dst_bias and dst_ids is not None:
+            total = total + self.dst_bias(dst_ids).squeeze(-1)
+        return total
 
 
 class IncrementalState:
@@ -103,6 +111,8 @@ class IncrementalState:
         self.rel_dst_count = defaultdict(int)
         self.src_dsts = defaultdict(set)
         self.src_rel_dsts = defaultdict(set)
+        # Per-pair last time for Trick B (pair_recency_feat)
+        self.pair_last_time = {}
         self.current_time = 0.0
         self.num_edges = 0
 
@@ -129,23 +139,28 @@ class IncrementalState:
         self.rel_dst_count[(rel, dst)] += 1
         self.src_dsts[src].add(dst)
         self.src_rel_dsts[(src, rel)].add(dst)
+        self.pair_last_time[(src, dst)] = t
         self.current_time = t
         self.num_edges += 1
 
     def get_entity_features(self, node, t):
         src_rec = t - self.last_time_src[node]
         dst_rec = t - self.last_time_dst[node]
-        return np.array([
+        feats = [
             np.log1p(self.out_degree[node]),
             np.log1p(self.in_degree[node]),
             np.log1p(max(0, src_rec)) if src_rec < 1e8 else -1.0,
             np.log1p(max(0, dst_rec)) if dst_rec < 1e8 else -1.0,
             np.log1p(self.n_relations[node]),
             np.log1p(self.n_neighbors[node]),
-        ], dtype=np.float32)
+        ]
+        if getattr(self, 'cold_start_feat', False):
+            feats.append(1.0 if self.out_degree[node] == 0 else 0.0)
+        return np.array(feats, dtype=np.float32)
 
     def get_all_entity_features(self, t):
-        feats = np.zeros((self.num_nodes, 6), dtype=np.float32)
+        feat_dim = 6 + int(getattr(self, 'cold_start_feat', False))
+        feats = np.zeros((self.num_nodes, feat_dim), dtype=np.float32)
         feats[:, 0] = np.log1p(self.out_degree)
         feats[:, 1] = np.log1p(self.in_degree)
         src_rec = t - self.last_time_src
@@ -156,11 +171,14 @@ class IncrementalState:
         feats[:, 3] = np.where(valid_dst, np.log1p(np.maximum(0, dst_rec)), -1.0)
         feats[:, 4] = np.log1p(self.n_relations)
         feats[:, 5] = np.log1p(self.n_neighbors)
+        if getattr(self, 'cold_start_feat', False):
+            feats[:, 6] = (self.out_degree == 0).astype(np.float32)
         return feats
 
     def get_nodes_entity_features(self, nodes, t):
         nodes = np.asarray(nodes, dtype=np.int64)
-        feats = np.zeros((len(nodes), 6), dtype=np.float32)
+        feat_dim = 6 + int(getattr(self, 'cold_start_feat', False))
+        feats = np.zeros((len(nodes), feat_dim), dtype=np.float32)
         feats[:, 0] = np.log1p(self.out_degree[nodes])
         feats[:, 1] = np.log1p(self.in_degree[nodes])
         src_rec = t - self.last_time_src[nodes]
@@ -171,15 +189,31 @@ class IncrementalState:
         feats[:, 3] = np.where(valid_dst, np.log1p(np.maximum(0, dst_rec)), -1.0)
         feats[:, 4] = np.log1p(self.n_relations[nodes])
         feats[:, 5] = np.log1p(self.n_neighbors[nodes])
+        if getattr(self, 'cold_start_feat', False):
+            feats[:, 6] = (self.out_degree[nodes] == 0).astype(np.float32)
         return feats
 
-    def get_pair_features(self, src, dst, rel):
-        return np.array([
+    def get_pair_features(self, src, dst, rel, t=None):
+        """4-dim (or 5-dim with pair_recency_feat) pair features."""
+        pair_cnt = self.pair_count.get((src, dst), 0)
+        pair_last_t = getattr(self, 'pair_last_time', {}).get((src, dst))
+        pair_feat = np.log1p(pair_cnt)
+        if getattr(self, 'pair_temp_decay', False) and t is not None:
+            if pair_last_t is None:
+                pair_feat = 0.0
+            else:
+                age = max(0.0, float(t) - float(pair_last_t))
+                pair_feat = np.log1p(pair_cnt * np.exp(-age / float(getattr(self, 'tau', 3600.0))))
+        base = [
             np.log1p(self.triple_count.get((src, dst, rel), 0)),
-            np.log1p(self.pair_count.get((src, dst), 0)),
+            pair_feat,
             np.log1p(self.pair_count.get((dst, src), 0)),
             np.log1p(self.rel_dst_count.get((rel, dst), 0)),
-        ], dtype=np.float32)
+        ]
+        if getattr(self, 'pair_recency_feat', False) and t is not None:
+            sd_rec = np.log1p(max(0.0, t - pair_last_t)) if pair_last_t is not None else -1.0
+            base.append(sd_rec)
+        return np.array(base, dtype=np.float32)
 
 
 def train_and_evaluate(args):
@@ -248,6 +282,11 @@ def train_and_evaluate(args):
         t0 = time.time()
         with open(cache_path, "rb") as f:
             state = pickle.load(f)
+        if not hasattr(state, 'pair_last_time'):
+            print("  (Rebuilding pair_last_time from warmup — old cache format)")
+            state.pair_last_time = {}
+            for i in range(warmup_end):
+                state.pair_last_time[(int(sources[i]), int(destinations[i]))] = float(timestamps[i])
         print(f"  Loaded in {time.time()-t0:.1f}s")
     else:
         print(f"\nWarming up on first {warmup_end} edges...")
@@ -294,8 +333,12 @@ def train_and_evaluate(args):
     print(f"\nCollecting {n_train} trainable edges...")
     t0 = time.time()
 
-    entity_feat_dim = 6
-    pair_feat_dim = 4
+    entity_feat_dim = 6 + int(getattr(args, 'cold_start_feat', False))
+    pair_feat_dim = 5 if getattr(args, 'pair_recency_feat', False) else 4
+    state.pair_recency_feat = getattr(args, 'pair_recency_feat', False)
+    state.cold_start_feat = getattr(args, 'cold_start_feat', False)
+    state.pair_temp_decay = getattr(args, 'pair_temp_decay', False)
+    state.tau = float(args.tau)
 
     train_src_feats = np.zeros((n_train, entity_feat_dim), dtype=np.float32)
     train_dst_feats = np.zeros((n_train, entity_feat_dim), dtype=np.float32)
@@ -303,6 +346,9 @@ def train_and_evaluate(args):
     train_neg_dst_feats = np.zeros((n_train, n_neg, entity_feat_dim), dtype=np.float32)
     train_neg_pair_feats = np.zeros((n_train, n_neg, pair_feat_dim), dtype=np.float32)
     train_rels = np.zeros(n_train, dtype=np.int64)
+    train_dst_ids = np.zeros(n_train, dtype=np.int64)
+    train_neg_dst_ids = np.zeros((n_train, n_neg), dtype=np.int64)
+    train_inv_freq_w = np.ones(n_train, dtype=np.float32) if getattr(args, 'inv_freq_weight', False) else None
 
     # We must process ALL edges sequentially for state updates
     feat_idx = 0
@@ -316,8 +362,11 @@ def train_and_evaluate(args):
         if i in train_set:
             train_src_feats[feat_idx] = state.get_entity_features(s, t_i)
             train_dst_feats[feat_idx] = state.get_entity_features(d, t_i)
-            train_pair_feats[feat_idx] = state.get_pair_features(s, d, 0)
+            train_pair_feats[feat_idx] = state.get_pair_features(s, d, 0, t_i)
             train_rels[feat_idx] = 0
+            train_dst_ids[feat_idx] = d
+            if train_inv_freq_w is not None:
+                train_inv_freq_w[feat_idx] = np.log(num_nodes / (1.0 + float(state.out_degree[s])))
 
             # Hard-neg + adaptive_alpha
             if args.hard_neg_ratio > 0:
@@ -338,7 +387,8 @@ def train_and_evaluate(args):
                     while nd == d:
                         nd = np.random.randint(num_nodes)
                 train_neg_dst_feats[feat_idx, k] = state.get_entity_features(nd, t_i)
-                train_neg_pair_feats[feat_idx, k] = state.get_pair_features(s, nd, 0)
+                train_neg_pair_feats[feat_idx, k] = state.get_pair_features(s, nd, 0, t_i)
+                train_neg_dst_ids[feat_idx, k] = nd
             feat_idx += 1
 
         state.update(s, d, t_i, 0)
@@ -367,7 +417,8 @@ def train_and_evaluate(args):
     # 4. Model
     model = HybridTKGScorer(
         num_relations, entity_feat_dim, pair_feat_dim,
-        rel_dim=args.rel_dim, hidden_dim=args.hidden_dim, dropout=args.dropout
+        rel_dim=args.rel_dim, hidden_dim=args.hidden_dim, dropout=args.dropout,
+        num_nodes=num_nodes, dst_bias=args.dst_bias
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel params: {n_params:,}")
@@ -380,6 +431,9 @@ def train_and_evaluate(args):
     t_neg_dst_f = torch.FloatTensor(train_neg_dst_feats).to(device)
     t_neg_pair_f = torch.FloatTensor(train_neg_pair_feats).to(device)
     t_rels = torch.LongTensor(train_rels).to(device)
+    t_dst_ids = torch.LongTensor(train_dst_ids).to(device)
+    t_neg_dst_ids = torch.LongTensor(train_neg_dst_ids).to(device)
+    t_inv_freq_w = torch.FloatTensor(train_inv_freq_w).to(device) if train_inv_freq_w is not None else None
 
     # Ablation
     if args.ablation == 'entity_only':
@@ -406,23 +460,27 @@ def train_and_evaluate(args):
 
         for i in range(0, n_train, args.batch_size):
             idx = perm[i:i + args.batch_size]
-            pos_scores = model(t_src_f[idx], t_dst_f[idx], t_rels[idx], t_pair_f[idx])
+            pos_scores = model(t_src_f[idx], t_dst_f[idx], t_rels[idx], t_pair_f[idx], t_dst_ids[idx])
             neg_scores_list = []
             for k in range(n_neg):
-                ns = model(t_src_f[idx], t_neg_dst_f[idx, k], t_rels[idx], t_neg_pair_f[idx, k])
+                ns = model(t_src_f[idx], t_neg_dst_f[idx, k], t_rels[idx], t_neg_pair_f[idx, k], t_neg_dst_ids[idx, k])
                 neg_scores_list.append(ns)
             neg_scores = torch.stack(neg_scores_list, dim=1)
             if args.loss == 'bpr':
                 diff = pos_scores.unsqueeze(1) - neg_scores
-                loss = -F.logsigmoid(diff).mean()
+                per_example_loss = -F.logsigmoid(diff).mean(dim=1)
             elif args.loss == 'ce':
                 all_scores = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
                 targets = torch.zeros(len(idx), dtype=torch.long, device=device)
-                loss = F.cross_entropy(all_scores, targets)
+                per_example_loss = F.cross_entropy(all_scores, targets, reduction='none')
             elif args.loss == 'margin':
                 margin = 0.1
                 diff = pos_scores.unsqueeze(1) - neg_scores
-                loss = torch.clamp(margin - diff, min=0).mean()
+                per_example_loss = torch.clamp(margin - diff, min=0).mean(dim=1)
+            if t_inv_freq_w is not None:
+                loss = (per_example_loss * t_inv_freq_w[idx]).mean()
+            else:
+                loss = per_example_loss.mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -514,7 +572,7 @@ def train_and_evaluate(args):
             dst_feats = (dst_feats_raw - ent_mean) / ent_std
             pair_feats = np.zeros((n_cand, pair_feat_dim), dtype=np.float32)
             for j, cand_dst in enumerate(all_dsts):
-                pair_feats[j] = state.get_pair_features(src_i, int(cand_dst), 0)
+                pair_feats[j] = state.get_pair_features(src_i, int(cand_dst), 0, t_i)
             pair_feats = (pair_feats - pair_mean) / pair_std
 
             if args.ablation == 'entity_only':
@@ -528,7 +586,8 @@ def train_and_evaluate(args):
                 dst_t = torch.FloatTensor(dst_feats).to(device)
                 rel_t = torch.zeros(n_cand, dtype=torch.long, device=device)
                 pair_t = torch.FloatTensor(pair_feats).to(device)
-                scores = model(src_t, dst_t, rel_t, pair_t).cpu().numpy()
+                dst_ids_t = torch.LongTensor(all_dsts).to(device)
+                scores = model(src_t, dst_t, rel_t, pair_t, dst_ids_t).cpu().numpy()
 
             mrr_list.append(compute_tie_aware_mrr(scores))
             n_scored += 1
@@ -554,6 +613,10 @@ def train_and_evaluate(args):
         "loss": args.loss,
         "hard_neg_ratio": args.hard_neg_ratio,
         "adaptive_alpha": args.adaptive_alpha,
+        "inv_freq_weight": args.inv_freq_weight,
+        "cold_start_feat": args.cold_start_feat,
+        "pair_temp_decay": args.pair_temp_decay,
+        "tau": args.tau,
     }
     os.makedirs("/data/chenlibin/TGB2/results", exist_ok=True)
     stem = f"tgbseq_{args.dataset}"
@@ -565,6 +628,12 @@ def train_and_evaluate(args):
         stem += f"_hn{args.hard_neg_ratio}"
         if args.adaptive_alpha:
             stem += "_adapt"
+    if args.inv_freq_weight:
+        stem += "_invfreq"
+    if args.cold_start_feat:
+        stem += "_cold"
+    if args.pair_temp_decay:
+        stem += f"_ptd{args.tau:g}"
     stem += f"_seed{args.seed}"
     out_path = get_safe_result_path(
         "/data/chenlibin/TGB2/results",
@@ -596,5 +665,17 @@ if __name__ == "__main__":
                         help="Fraction of negatives sampled from historical neighbors (0=off)")
     parser.add_argument("--adaptive_alpha", action="store_true",
                         help="Per-source adaptive alpha: alpha(s) = hard_neg_ratio * (1 - node_rec_rate(s))")
+    parser.add_argument("--pair_recency_feat", action="store_true",
+                        help="Trick B: add log(t - pair_last_time(s,d)) as 5th pair feature")
+    parser.add_argument("--inv_freq_weight", action="store_true",
+                        help="Trick G: weight each training example by log(num_nodes / (1 + out_degree[src]))")
+    parser.add_argument("--cold_start_feat", action="store_true",
+                        help="Trick I: append is_cold = 1 if out_degree[node] == 0")
+    parser.add_argument("--pair_temp_decay", action="store_true",
+                        help="Trick J: replace pair_count with a temporally decayed count feature when t is available")
+    parser.add_argument("--tau", type=float, default=3600.0,
+                        help="Trick J decay constant in seconds (default: 3600)")
+    parser.add_argument("--dst_bias", action="store_true",
+                        help="Trick E: add a learnable destination bias residual")
     args = parser.parse_args()
     train_and_evaluate(args)
